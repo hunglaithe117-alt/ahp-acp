@@ -1,93 +1,78 @@
 # ACP/AHP Examples
 
-Working examples of the **Agent Communication Protocol (ACP)** and **Agent Host Protocol (AHP)** — Microsoft's standards for agent-to-client and multi-client session coordination.
+Runnable examples of the **Agent Communication Protocol (ACP)** and the **Agent Host
+Protocol (AHP)**, in Python and Rust.
 
-```
-┌──────────────┐      ┌──────────────┐      ┌──────────────┐
-│  ACP Agent   │◄────►│  ACP Bridge  │◄────►│  OpenAI API  │
-│  (stdio)     │      │  (in-process)│      │  (port 8000) │
-└──────────────┘      └──────────────┘      └──────────────┘
-
-┌──────────────┐      ┌──────────────┐      ┌──────────────┐
-│  Client A    │◄────►│  AHP Host    │◄────►│  Client B    │
-│  (WebSocket) │      │  (port 8000) │      │  (WebSocket) │
-└──────────────┘      └──────────────┘      └──────────────┘
-       ▲                     │                     ▲
-       └─────────────────────┴─────────────────────┘
-              Shared session state (Redux-like)
-```
+| Path | Contents |
+|---|---|
+| `src/` | Python: ACP echo agent, OpenAI-compatible HTTP bridge, AHP WebSocket host, demo client |
+| `rust/` | Rust: `acp-echo-agent`, `acp-openai-bridge`, `ahp-host`, `ahp-client-demo` (see [`rust/README.md`](./rust/README.md)) |
 
 ## Setup
 
 ```bash
-uv sync
+uv sync          # Python 3.11+, creates .venv from uv.lock
 ```
 
-Requires Python 3.11+.
+```bash
+cd rust && cargo build   # Rust with edition 2024 support
+```
 
-## Echo Agent
+## Python — Echo Agent
 
-The simplest ACP agent: echoes back whatever the client sends.
+The smallest ACP agent: it echoes back every text content block it receives.
 
 ```bash
 uv run python src/acp_echo_agent.py
 ```
 
-The agent communicates over **stdio** using JSON-RPC messages. It implements core ACP lifecycle methods:
+The agent speaks JSON-RPC over **stdio** and runs until stdin closes. It overrides three
+`acp.Agent` methods:
 
-| Method | Purpose |
+| Method | Behavior |
 |---|---|
-| `initialize` | Negotiates protocol version and advertises capabilities |
-| `new_session` | Creates a session and returns a session ID |
-| `prompt` | Receives user content blocks, streams agent responses back |
+| `initialize` | Returns `InitializeResponse` with the requested protocol version |
+| `new_session` | Returns a `NewSessionResponse` with the fixed ID `session-1` |
+| `prompt` | Emits each text block back as an `AgentMessageChunk` via `session_update`, then returns `stop_reason="end_turn"` |
 
-### How it works
+`EchoAgent.on_connect(conn)` stores the client connection, which is the object used to push
+`session_update` notifications while a prompt is in flight. Non-text blocks (image, audio,
+resource, embedded resource) are accepted by the signature and skipped.
 
-1. A client (e.g., VS Code with Copilot) spawns the agent as a subprocess
-2. The client sends `initialize`, then `new_session`, then `prompt` messages over stdin
-3. The agent echoes each prompt content block back as an `AgentMessageChunk` via `session_update`
-4. The response is streamed to the client in real-time
+## Python — OpenAI-Compatible REST Bridge
 
-### ACP concepts demonstrated
-
-- **Agent protocol**: implementing the `Agent` interface from the `acp` SDK
-- **Connection lifecycle**: `on_connect` receives the client connection for bidirectional messaging
-- **Session management**: creating and tracking sessions with unique IDs
-- **Streaming responses**: using `session_update` to push message chunks to the client
-- **Content blocks**: constructing `TextContentBlock` and wrapping them in `AgentMessageChunk`
-
-## OpenAI-Compatible REST Bridge
-
-A FastAPI server that exposes an OpenAI-compatible `/v1/chat/completions` endpoint backed by the ACP echo agent. Any tool that speaks the OpenAI API (LangChain, LlamaIndex, OpenAI SDK, etc.) can talk to an ACP agent through this bridge.
-
-### Start the server
+`src/openai_server.py` is a FastAPI app that exposes an OpenAI-shaped HTTP API in front of
+the ACP echo agent. It also hosts the AHP WebSocket endpoint described below.
 
 ```bash
-uv run python -m src.openai_server
+uv run python -m src.openai_server   # http://localhost:8000
 ```
-
-The server listens on `http://localhost:8000`.
-
-### Endpoints
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/health` | Health check |
-| `GET` | `/v1/models` | List available models |
-| `POST` | `/v1/chat/completions` | Chat completion (supports streaming) |
+| `GET` | `/health` | Returns `{"status": "ok"}` |
+| `GET` | `/v1/models` | Lists the single model `acp-echo` |
+| `POST` | `/v1/chat/completions` | Chat completion, streaming or not |
+| `WS` | `/ws/ahp` | AHP multi-client session coordination |
 
-### Example — curl
+Request body (`ChatCompletionRequest`): `model` (default `acp-echo`), `messages`
+(`role`, `content`), `stream` (default `false`), `temperature`, `max_tokens`.
+Only `messages` is required.
+
+Errors:
+
+- `400` — body is not valid JSON, or `messages` is empty
+- `422` — body fails `ChatCompletionRequest` validation
+
+### curl
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{
-    "model": "acp-echo",
-    "messages": [{"role": "user", "content": "Hello from ACP!"}]
-  }'
+  -d '{"model": "acp-echo", "messages": [{"role": "user", "content": "Hello from ACP!"}]}'
 ```
 
-### Example — OpenAI Python SDK
+### OpenAI Python SDK
 
 ```python
 from openai import OpenAI
@@ -103,126 +88,146 @@ print(response.choices[0].message.content)
 
 ### Streaming
 
-Set `"stream": true` in the request body to receive Server-Sent Events (SSE):
+With `"stream": true` the endpoint returns `text/event-stream` chunks:
+
+1. a chunk carrying `delta.role = "assistant"`
+2. one chunk per text chunk produced by the agent
+3. a chunk with `finish_reason = "stop"`
+4. the `data: [DONE]` sentinel
 
 ```bash
 curl -N http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{
-    "model": "acp-echo",
-    "messages": [{"role": "user", "content": "Hello!"}],
-    "stream": true
-  }'
+  -d '{"model": "acp-echo", "messages": [{"role": "user", "content": "Hello!"}], "stream": true}'
 ```
 
-### Architecture
+### How the bridge works
 
-The bridge works without spawning subprocesses or setting up JSON-RPC transports. It calls the ACP agent's methods directly in-process:
-
-1. An `AdapterClient` implements the `Client` protocol and captures `session_update` calls
-2. The `EchoAgent` is instantiated and connected to the adapter via `on_connect`
-3. `initialize()`, `new_session()`, and `prompt()` are called directly on the agent
-4. The adapter collects the text from `AgentMessageChunk` updates
-5. The server formats the result as an OpenAI-compatible response
+No subprocess and no stdio: the agent runs inside the FastAPI process.
 
 ```
-HTTP Request → FastAPI → bridge.chat() → EchoAgent → AdapterClient → HTTP Response
+HTTP request → openai_server.chat()/chat_stream() → bridge.py
+             → EchoAgent (in-process ACP agent)
+             → AdapterClient.session_update() → text queue → response / SSE
 ```
 
-## AHP Multi-Client Host
+`src/bridge.py` connects `EchoAgent` to an `AdapterClient` that implements the ACP `Client`
+side. `chat_stream()` calls `initialize(protocol_version=1)`, `new_session(cwd="/")`, and
+`prompt()` directly, yielding text from the adapter's queue as it arrives. `chat()` joins
+those chunks. `AdapterClient` implements the rest of the `Client` surface (terminals, file
+access, permissions, elicitation, extensions) as `NotImplementedError` — the echo agent never
+calls them.
 
-A simplified Python implementation of AHP (Agent Host Protocol) concepts: WebSocket-based multi-client session coordination with shared, immutable state.
+## Python — AHP Host
 
-### Start the server
+`src/ahp_host.py` implements the host side of an AHP-style coordination layer: URI-addressed
+channels, Redux-like state, and server-sequenced actions broadcast to subscribers. It is a
+plain WebSocket protocol (not JSON-RPC) served on the same FastAPI app at
+`ws://localhost:8000/ws/ahp`.
 
-The AHP host runs on the same FastAPI server as the OpenAI bridge (port 8000):
+### Channels and state
 
-```bash
-uv run python -m src.openai_server
-```
+Channel state is created on first subscribe:
 
-The WebSocket endpoint is available at `ws://localhost:8000/ws/ahp`.
-
-### Connect multiple clients
-
-Run the built-in demo client to see two clients (Alice and Bob) connect to the same session:
-
-```bash
-uv run python -m src.ahp_client
-```
-
-This demonstrates:
-- Both clients subscribe to the same session channel
-- Each client sees the shared state snapshot
-- Actions dispatched by one client are broadcast to all subscribers
-- State updates are server-sequenced with monotonic `serverSeq` numbers
-
-### AHP concepts demonstrated
-
-| Concept | Implementation |
+| Channel URI | Initial state |
 |---|---|
-| **Channels** | URI-identified resources (`ahp-session:/<id>`, `ahp-chat:/<id>`) |
-| **State** | Immutable Redux-like dict per channel, mutated only by actions |
-| **Actions** | Typed mutations (`chat/turnStarted`, `chat/turnCompleted`, etc.) |
-| **Server sequencing** | Monotonic `serverSeq` on every action for ordering and gap detection |
-| **Subscriptions** | Clients subscribe to channels; receive snapshots on join, actions as they happen |
-| **Multi-client coordination** | N clients observe and participate in the same session state |
+| `ahp-session:/<id>` | `{"title": "New Session", "sessionId": "<id>", "status": "ready", "chats": [], "activeClients": []}` |
+| `ahp-chat:/<id>` | `{"title": "New Chat", "chatId": "<id>", "sessionId": "<id>", "turns": [], "status": "active"}` |
+| anything else | `{}` |
 
-### WebSocket message format
+Subscribing to a session channel does not add chats to `chats`; the server never appends to
+`chats` or `activeClients` on its own. Those lists change only through actions.
 
-```json
-// Subscribe to a session
-→ {"method": "subscribe", "params": {"channel": "ahp-session:/demo"}}
+### Messages
 
-// Receive current state
+All messages are JSON objects with a `method` and `params`. A `id` field is optional; when
+present, the host replies with a matching `result` object in addition to any broadcast.
+
+```jsonc
+// subscribe → snapshot of the current state
+→ {"method": "subscribe", "params": {"channel": "ahp-session:/demo"}, "id": 1}
 ← {"method": "snapshot", "params": {"channel": "ahp-session:/demo", "state": {...}, "serverSeq": 0}}
+← {"id": 1, "result": {"subscribed": true}}
 
-// Dispatch a chat action
+// unsubscribe
+→ {"method": "unsubscribe", "params": {"channel": "ahp-session:/demo"}, "id": 2}
+← {"id": 2, "result": {"unsubscribed": true}}
+
+// dispatchAction → the action is stamped with serverSeq, reduced into state, broadcast
 → {"method": "dispatchAction", "params": {
-    "channel": "ahp-chat:/demo",
-    "action": {"type": "chat/turnStarted", "payload": {"text": "Hello", "origin": "user"}}
-}}
-
-// Broadcast to all subscribers
+     "channel": "ahp-chat:/demo",
+     "action": {"type": "chat/turnStarted", "payload": {"text": "Hello", "origin": "user"}}
+   }, "id": 3}
 ← {"method": "action", "params": {
-    "channel": "ahp-chat:/demo",
-    "action": {"type": "chat/turnStarted", "payload": {...}, "serverSeq": 1},
-    "serverSeq": 1
-}}
+     "channel": "ahp-chat:/demo",
+     "action": {"type": "chat/turnStarted", "payload": {...}, "serverSeq": 1},
+     "serverSeq": 1
+   }}
+← {"id": 3, "result": {"serverSeq": 1}}
 ```
 
-### Session state shape
+Unparseable JSON answers `{"error": "Invalid JSON"}`; an unknown method answers
+`{"error": "Unknown method: <name>"}`. Both include `id` when the request carried one.
 
-```json
-{
-  "title": "New Session",
-  "sessionId": "demo",
-  "status": "ready",
-  "chats": ["ahp-chat:/demo"],
-  "activeClients": ["uuid-1", "uuid-2"]
-}
-```
+### Actions
 
-## Rust Examples
+`_apply_action` is the reducer. Every action produces a fresh state object; `serverSeq` is
+attached to the action, not stored in a dedicated state field.
 
-The [`rust/`](./rust/) directory contains Rust implementations of both ACP and AHP:
-
-| Crate | Description |
+| Action type | Effect |
 |---|---|
-| `acp-echo-agent` | ACP echo agent binary (stdio) using `agent-client-protocol` v2.0 |
-| `acp-openai-bridge` | Axum HTTP server bridging OpenAI format to ACP agent |
-| `ahp-host` | AHP WebSocket server using `ahp-types` v0.6 wire format |
-| `ahp-client-demo` | Demo client using the official `ahp` + `ahp-ws` crates |
+| `chat/turnStarted` | Appends a turn `{id: "turn-<8 hex>", message: {text, origin}, responseParts: [], state: "in_progress"}` to `turns` |
+| `chat/responseChunk` | Appends the payload to `responseParts` of the most recent in-progress turn |
+| `chat/turnCompleted` | Sets `responseParts` and `state: "complete"` on the most recent in-progress turn |
+| `session/titleChanged` | Sets `title` from `payload.title` |
+| `session/chatAdded` | Appends `payload.chatUri` to `chats` if not already present |
+| `session/clientJoined` | Appends `payload.clientId` to `activeClients` if not already present |
+| `session/clientLeft` | Removes `payload.clientId` from `activeClients` |
+
+The reducer is shared by session and chat state: it operates on whatever keys exist and
+creates `turns` when an action needs it.
+
+On disconnect, the host removes the client from every subscribed channel and, for
+`ahp-session:/` channels, dispatches `session/clientLeft` with a new `serverSeq` so other
+subscribers observe the departure.
+
+### Demo client
+
+```bash
+uv run python -m src.ahp_client   # requires the server from src.openai_server
+```
+
+`src/ahp_client.py` opens two WebSocket clients (Alice and Bob) against
+`ws://localhost:8000/ws/ahp`. Each subscribes to `ahp-session:/demo` and `ahp-chat:/demo`
+(consuming one snapshot per subscription), dispatches one `chat/turnStarted` action, logs the
+broadcast it receives, then reads further updates with a 2 second per-message timeout before
+exiting.
+
+## Rust
+
+Four crates in a Cargo workspace under [`rust/`](./rust/), covering the same ground plus a
+typed AHP server and an SDK-based demo client:
+
+| Crate | Listens on | Description |
+|---|---|---|
+| `acp-echo-agent` | stdio | ACP echo agent on `agent-client-protocol` 2.0 |
+| `acp-openai-bridge` | `0.0.0.0:3000` (`BIND_ADDR`) | Axum server in front of an in-process ACP agent |
+| `ahp-host` | `0.0.0.0:3001` (`BIND_ADDR`) | JSON-RPC WebSocket server built on `ahp-types` 0.6 |
+| `ahp-client-demo` | — | Demo client using `ahp` + `ahp-ws`, expects the host on `ws://localhost:3001/ws/ahp` |
 
 ```bash
 cd rust && cargo build
 ```
 
-See [`rust/README.md`](./rust/README.md) for details on each crate.
+See [`rust/README.md`](./rust/README.md) for endpoints, message formats, and per-crate
+details.
 
-## Dependencies
+## Python Dependencies
 
-- `agent-client-protocol` — the official ACP Python SDK
-- `fastapi` / `uvicorn` — HTTP server for the OpenAI-compatible bridge and AHP WebSocket host
-- `pydantic` — request/response validation
-- `websockets` — async WebSocket client for the AHP demo
+| Package | Used for |
+|---|---|
+| `agent-client-protocol` | ACP agent and client interfaces, schema types, stdio transport |
+| `fastapi` / `uvicorn` | HTTP endpoints, WebSocket endpoint, server process |
+| `pydantic` | Request and response models for the OpenAI-compatible API |
+| `websockets` | WebSocket client in `src/ahp_client.py` |
+| `httpx` (dev) | HTTP client for local testing |
