@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+
+# Python tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pytype/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Rust / Cargo
+target/
+**/target/
+*.rs.bk
+*.pdb
+
+# Env and secrets
+.env
+.env.*
+!.env.example
+
+# Logs and local runtime artifacts
+*.log
+logs/
+tmp/
+*.pid
+*.socket
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Agent workspace
+.slim/deepwork/

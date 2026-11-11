@@ -1,0 +1,18 @@
+[project]
+name = "acp-examples"
+version = "0.1.0"
+description = "Working examples of the Agent Communication Protocol (ACP) and Agent Host Protocol (AHP)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "agent-client-protocol>=0.11.1",
+    "fastapi>=0.141.1",
+    "pydantic>=2.13.4",
+    "uvicorn>=0.52.0",
+    "websockets>=17.0.1",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+]

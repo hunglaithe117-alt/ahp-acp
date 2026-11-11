@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = [
+    "acp-echo-agent",
+    "acp-openai-bridge",
+    "ahp-host",
+    "ahp-client-demo",
+]
